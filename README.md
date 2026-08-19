@@ -2,13 +2,13 @@
 
 In order to build the StorRAG Appliance we will need two models, a Vector Database, a Model Service and an AI Application.
 
-Download models
-Deploy the Vector Database
-Build the Model Service
-Deploy the Model Service
-Build the AI Application
-Deploy the AI Application
-Interact with the AI Application
+- Download models
+- Deploy the Vector Database
+- Build the Model Service
+- Deploy the Model Service
+- Build the AI Application
+- Deploy the AI Application
+- Interact with the AI Application
 
 ## Download models
 
