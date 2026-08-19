@@ -12,7 +12,7 @@ In order to build this application we will need two models, a Vector Database, a
 
 ### Download models
 
-If you are just getting started, we recommend using [Granite-7B-Lab](https://huggingface.co/instructlab/granite-7b-lab-GGUF). This is a well
+If you are just getting started, we recommend using [granite-3.3-8b-instruct](https://huggingface.co/ibm-granite/granite-3.3-8b-instruct-GGUF). This is a well
 performant mid-sized model with an apache-2.0 license that has been quanitzed and served into the [GGUF format](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md).
 
 The recommended model can be downloaded using the code snippet below:
