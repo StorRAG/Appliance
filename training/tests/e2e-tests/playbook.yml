@@ -1,0 +1,56 @@
+---
+- name: Test Environment Provisioning
+  hosts: test_environments
+  remote_user: root
+  become: true
+  gather_facts: false
+
+  tasks:
+
+  - name: Wait until the instance is ready
+    ansible.builtin.wait_for_connection:
+    delay: 15
+    timeout: 180
+
+  - name: Gather facts for first time
+    ansible.builtin.setup:
+
+  - name: ilab init
+    shell: ilab init
+    environment:
+      HF_TOKEN: "{{ HF_TOKEN }}"
+
+  - name: ilab pull the models for debug currently
+    shell: ilab download --repository mistralai/Mixtral-8x7B-Instruct-v0.1
+    environment:
+      HF_TOKEN: "{{ HF_TOKEN }}"
+
+  - name: ilab pull the models for debug currently
+    shell: ilab download --repository ibm/granite-7b-base
+    environment:
+      HF_TOKEN: "{{ HF_TOKEN }}"
+
+  - name: Get test script
+    ansible.builtin.get_url:
+      url: https://raw.githubusercontent.com/instructlab/instructlab/main/scripts/basic-workflow-tests.sh
+      dest: /tmp/basic-workflow-tests.sh
+      mode: 755
+    environment:
+      HF_TOKEN: "{{ HF_TOKEN }}"
+
+  # Allow for debugging with tmate
+  # - name: Wait for 15 minutes
+  #   pause:
+  #     minutes: 15
+
+  - name: Run tests
+    ansible.builtin.shell: /tmp/basic-workflow-tests.sh
+    register: out
+
+  - name: Test Results - stdout
+    debug:
+      msg: "{{out.stdout_lines}}"
+
+  - name: Test Results - stderr
+    debug:
+      msg: "{{out.stderr_lines}}"

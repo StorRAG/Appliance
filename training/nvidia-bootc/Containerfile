@@ -1,0 +1,202 @@
+ARG DRIVER_TOOLKIT_IMAGE="quay.io/ai-lab/nvidia-builder:latest"
+ARG BASEIMAGE="quay.io/centos-bootc/centos-bootc:stream9"
+ARG INSTRUCTLAB_IMAGE="quay.io/ai-lab/instructlab-nvidia:latest"
+
+FROM ${DRIVER_TOOLKIT_IMAGE} as builder
+
+ARG BASE_URL='https://us.download.nvidia.com/tesla'
+
+ARG BUILD_ARCH=''
+ARG TARGET_ARCH=''
+
+ARG DRIVER_VERSION='550.90.07'
+
+ARG VENDOR=''
+ARG RPM_HOST=''
+
+USER builder
+
+WORKDIR /home/builder
+COPY --chown=1001:0 x509-configuration.ini x509-configuration.ini
+
+RUN export KVER=$(rpm -q --qf "%{VERSION}" kernel-core) \
+        KREL=$(rpm -q --qf "%{RELEASE}" kernel-core | sed 's/\.el.\(_.\)*$//') \
+        KDIST=$(rpm -q --qf "%{RELEASE}" kernel-core | awk -F '.' '{ print "."$NF}') \
+        OS_VERSION_MAJOR=$(grep "^VERSION=" /etc/os-release | cut -d '=' -f 2 | sed 's/"//g' | cut -d '.' -f 1) \
+    && if [ "${BUILD_ARCH}" == "" ]; then \
+        export BUILD_ARCH=$(arch) \
+        && export TARGET_ARCH=$(echo "${BUILD_ARCH}" | sed 's/+64k//') ;\
+    fi \
+    && DRIVER_STREAM=$(echo ${DRIVER_VERSION} | cut -d '.' -f 1) \
+    && git clone --depth 1 --single-branch -b rhel${OS_VERSION_MAJOR} https://github.com/NVIDIA/yum-packaging-precompiled-kmod \
+    && cd yum-packaging-precompiled-kmod \
+    && mkdir BUILD BUILDROOT RPMS SRPMS SOURCES SPECS \
+    && mkdir nvidia-kmod-${DRIVER_VERSION}-${BUILD_ARCH} \
+    && curl -sLOf ${BASE_URL}/${DRIVER_VERSION}/NVIDIA-Linux-${TARGET_ARCH}-${DRIVER_VERSION}.run \
+    && sh ./NVIDIA-Linux-${TARGET_ARCH}-${DRIVER_VERSION}.run --extract-only --target tmp \
+    && mv tmp/kernel-open nvidia-kmod-${DRIVER_VERSION}-${BUILD_ARCH}/kernel \
+    && tar -cJf SOURCES/nvidia-kmod-${DRIVER_VERSION}-${BUILD_ARCH}.tar.xz nvidia-kmod-${DRIVER_VERSION}-${BUILD_ARCH} \
+    && mv kmod-nvidia.spec SPECS/ \
+    && openssl req -x509 -new -nodes -utf8 -sha256 -days 36500 -batch \
+      -config ${HOME}/x509-configuration.ini \
+      -outform DER -out SOURCES/public_key.der \
+      -keyout SOURCES/private_key.priv \
+    && rpmbuild \
+        --define "% _arch ${BUILD_ARCH}" \
+        --define "%_topdir $(pwd)" \
+        --define "debug_package %{nil}" \
+        --define "kernel ${KVER}" \
+        --define "kernel_release ${KREL}" \
+        --define "kernel_dist ${KDIST}" \
+        --define "driver ${DRIVER_VERSION}" \
+        --define "driver_branch ${DRIVER_STREAM}" \
+        --define "vendor ${VENDOR:-undefined}" \
+        --define "_buildhost ${RPM_HOST:-${HOSTNAME}}" \
+        -v -bb SPECS/kmod-nvidia.spec
+
+FROM ${BASEIMAGE}
+
+ARG BASE_URL='https://us.download.nvidia.com/tesla'
+
+ARG VENDOR=''
+LABEL vendor=${VENDOR}
+LABEL org.opencontainers.image.vendor=${VENDOR}
+
+ARG DRIVER_TYPE=passthrough
+ENV NVIDIA_DRIVER_TYPE=${DRIVER_TYPE}
+
+ARG DRIVER_VERSION='550.90.07'
+ENV NVIDIA_DRIVER_VERSION=${DRIVER_VERSION}
+ARG CUDA_VERSION='12.4.1'
+
+ARG TARGET_ARCH=''
+ENV TARGETARCH=${TARGET_ARCH}
+
+ARG EXTRA_RPM_PACKAGES=''
+
+# Disable vGPU version compatibility check by default
+ARG DISABLE_VGPU_VERSION_CHECK=true
+ENV DISABLE_VGPU_VERSION_CHECK=$DISABLE_VGPU_VERSION_CHECK
+
+USER root
+
+COPY --from=builder /home/builder/yum-packaging-precompiled-kmod/RPMS/*/*.rpm /rpms/
+# Temporary workaround until the permanent fix for libdnf is merged
+COPY nvidia-toolkit-firstboot.service /usr/lib/systemd/system/nvidia-toolkit-firstboot.service
+# Enable common services
+COPY duplicated/common/usr /usr
+
+ARG IMAGE_VERSION_ID
+
+# TODO: rework this monstrosity into a build.sh (or even not shell script)
+# The need for the `cp /etc/dnf/dnf.conf` is a workaround for https://github.com/containers/bootc/issues/637
+RUN mv /etc/selinux /etc/selinux.tmp \
+    && dnf install -y /rpms/kmod-nvidia-*.rpm \
+    && export OS_VERSION_MAJOR=$(grep "^VERSION=" /etc/os-release | cut -d '=' -f 2 | sed 's/"//g' | cut -d '.' -f 1) \
+    && if [ "${TARGET_ARCH}" == "" ]; then \
+        export TARGET_ARCH="$(arch)" ;\
+    fi \
+    && if [ "${TARGET_ARCH}" == "aarch64" ]; then CUDA_REPO_ARCH="sbsa"; fi \
+    && export DRIVER_STREAM=$(echo ${DRIVER_VERSION} | cut -d '.' -f 1) \
+        CUDA_VERSION_ARRAY=(${CUDA_VERSION//./ }) \
+        CUDA_DASHED_VERSION=${CUDA_VERSION_ARRAY[0]}-${CUDA_VERSION_ARRAY[1]} \
+        CUDA_REPO_ARCH=${TARGET_ARCH} \
+    && cp -a /etc/dnf/dnf.conf{,.tmp} && mv /etc/dnf/dnf.conf{.tmp,} \
+    && dnf config-manager --best --nodocs --setopt=install_weak_deps=False --save \
+    && dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel${OS_VERSION_MAJOR}/${CUDA_REPO_ARCH}/cuda-rhel${OS_VERSION_MAJOR}.repo \
+    && dnf -y module enable nvidia-driver:${DRIVER_STREAM}/default \
+    && dnf install -y \
+        cloud-init \
+        git \
+        git-lfs \
+        pciutils \
+        tmux \
+        nvidia-driver-${DRIVER_VERSION} \
+        nvidia-driver-cuda-${DRIVER_VERSION} \
+        nvidia-driver-libs-${DRIVER_VERSION} \
+        nvidia-driver-NVML-${DRIVER_VERSION} \
+        cuda-compat-${CUDA_DASHED_VERSION} \
+        cuda-cudart-${CUDA_DASHED_VERSION} \
+        nvidia-persistenced-${DRIVER_VERSION} \
+        nvidia-container-toolkit \
+        rsync \
+	skopeo \
+        ${EXTRA_RPM_PACKAGES} \
+    && if [[ "$(rpm -qa | grep kernel-core | wc -l)" != "1" ]]; then \
+        echo "ERROR - Multiple kernel-core packages detected"; \
+        echo "This usually means that nvidia-drivers are built for a different kernel version than the one installed"; \
+        exit 1; \
+       fi \
+    && if [ "$DRIVER_TYPE" != "vgpu" ] && [ "$TARGET_ARCH" != "arm64" ]; then \
+        versionArray=(${DRIVER_VERSION//./ }); \
+        DRIVER_BRANCH=${versionArray[0]}; \
+        dnf module enable -y nvidia-driver:${DRIVER_BRANCH} && \
+        dnf install -y nvidia-fabric-manager-${DRIVER_VERSION} libnvidia-nscq-${DRIVER_BRANCH}-${DRIVER_VERSION} ; \
+    fi \
+    && . /etc/os-release && if [ "${ID}" == "rhel" ]; then \
+        # Install rhc connect for insights telemetry gathering
+        dnf install -y rhc rhc-worker-playbook; \
+        # Adding rhel ai identity to os-release file for insights usage
+        sed -i -e "/^VARIANT=/ {s/^VARIANT=.*/VARIANT=\"RHEL AI\"/; t}" -e "\$aVARIANT=\"RHEL AI\"" /usr/lib/os-release; \
+        sed -i -e "/^VARIANT_ID=/ {s/^VARIANT_ID=.*/VARIANT_ID=rhel_ai/; t}" -e "\$aVARIANT_ID=rhel_ai" /usr/lib/os-release; \
+        sed -i -e "/^RHEL_AI_VERSION_ID=/ {s/^RHEL_AI_VERSION_ID=.*/RHEL_AI_VERSION_ID='${IMAGE_VERSION_ID}'/; t}" -e "\$aRHEL_AI_VERSION_ID='${IMAGE_VERSION_ID}'" /usr/lib/os-release; \
+        # disable auto upgrade service
+        rm -f /usr/lib/systemd/system/default.target.wants/bootc-fetch-apply-updates.timer; \
+        fi \
+    && dnf clean all \
+    && ln -s ../cloud-init.target /usr/lib/systemd/system/default.target.wants \
+    && mv /etc/selinux.tmp /etc/selinux \
+    && ln -s /usr/lib/systemd/system/nvidia-toolkit-firstboot.service /usr/lib/systemd/system/basic.target.wants/nvidia-toolkit-firstboot.service \
+    && echo "blacklist nouveau" > /etc/modprobe.d/blacklist_nouveau.conf \
+    && sed -i '/\[Unit\]/a ConditionDirectoryNotEmpty=/proc/driver/nvidia-nvswitch/devices' /usr/lib/systemd/system/nvidia-fabricmanager.service \
+    && ln -s /usr/lib/systemd/system/nvidia-fabricmanager.service /etc/systemd/system/multi-user.target.wants/nvidia-fabricmanager.service \
+    && ln -s /usr/lib/systemd/system/nvidia-persistenced.service /etc/systemd/system/multi-user.target.wants/nvidia-persistenced.service
+
+ARG SSHPUBKEY
+
+# The --build-arg "SSHPUBKEY=$(cat ~/.ssh/id_rsa.pub)" option inserts your
+# public key into the image, allowing root access via ssh.
+RUN if [ -n "${SSHPUBKEY}" ]; then \
+    set -eu; mkdir -p /usr/ssh && \
+        echo 'AuthorizedKeysFile /usr/ssh/%u.keys .ssh/authorized_keys .ssh/authorized_keys2' >> /etc/ssh/sshd_config.d/30-auth-system.conf && \
+	    echo ${SSHPUBKEY} > /usr/ssh/root.keys && chmod 0600 /usr/ssh/root.keys; \
+fi
+
+# Setup /usr/lib/containers/storage as an additional store for images.
+# Remove once the base images have this set by default.
+# Also make sure not to duplicate if a base image already has it specified.
+RUN grep -q /usr/lib/containers/storage /etc/containers/storage.conf || \
+    sed -i -e '/additionalimage.*/a "/usr/lib/containers/storage",' \
+	/etc/containers/storage.conf
+
+COPY duplicated/ilab-wrapper/ilab /usr/bin/ilab
+RUN chmod +x /usr/bin/ilab
+
+ARG INSTRUCTLAB_IMAGE="quay.io/ai-lab/instructlab-nvidia:latest"
+ARG INSTRUCTLAB_IMAGE_PULL_SECRET="instructlab-nvidia-pull"
+
+RUN for i in /usr/bin/ilab*; do \
+	sed -i 's/__REPLACE_TRAIN_DEVICE__/cuda/' $i;  \
+	sed -i 's/__REPLACE_CONTAINER_DEVICE__/nvidia.com\/gpu=all/' $i; \
+	sed -i "s%__REPLACE_IMAGE_NAME__%${INSTRUCTLAB_IMAGE}%" $i; \
+    done
+
+# Added for running as an OCI Container to prevent Overlay on Overlay issues.
+VOLUME /var/lib/containers
+
+RUN --mount=type=secret,id=${INSTRUCTLAB_IMAGE_PULL_SECRET}/.dockerconfigjson \
+    if [ -f "/run/.input/instructlab-nvidia/oci-layout" ]; then \
+         IID=$(podman --root /usr/lib/containers/storage --storage-opt overlay.force_mask=shared pull oci:/run/.input/instructlab-nvidia) && \
+         podman --root /usr/lib/containers/storage --storage-opt overlay.force_mask=shared image tag ${IID} ${INSTRUCTLAB_IMAGE}; \
+    elif [ -f "/run/secrets/${INSTRUCTLAB_IMAGE_PULL_SECRET}/.dockerconfigjson" ]; then \
+         IID=$(sudo podman --root /usr/lib/containers/storage pull --storage-opt overlay.force_mask=shared --authfile /run/secrets/${INSTRUCTLAB_IMAGE_PULL_SECRET}/.dockerconfigjson ${INSTRUCTLAB_IMAGE}); \
+    else \
+         IID=$(sudo podman --root /usr/lib/containers/storage --storage-opt overlay.force_mask=shared pull ${INSTRUCTLAB_IMAGE}); \
+    fi && \
+    chmod -R a+rX /usr/lib/containers
+
+COPY containers-storage.conf /etc/skel/.config/containers/storage.conf
+
+RUN podman system reset --force 2>/dev/null
+
+LABEL image_version_id="${IMAGE_VERSION_ID}"

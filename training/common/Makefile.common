@@ -1,0 +1,127 @@
+FROM ?=
+HARDWARE ?=
+
+REGISTRY ?= quay.io
+REGISTRY_ORG ?= ai-lab
+IMAGE_NAME ?= $(HARDWARE)-bootc
+IMAGE_TAG ?= latest
+BOOTC_IMAGE ?= ${REGISTRY}/${REGISTRY_ORG}/${IMAGE_NAME}:${IMAGE_TAG}
+BOOTC_MODELS_IMAGE ?= ${REGISTRY}/${REGISTRY_ORG}/${IMAGE_NAME}-models:${IMAGE_TAG}
+BOOTC_CLOUD_IMAGE ?= ${REGISTRY}/${REGISTRY_ORG}/${IMAGE_NAME}-cloud:${IMAGE_TAG}
+BOOTC_CLOUD_MODELS_IMAGE ?= ${REGISTRY}/${REGISTRY_ORG}/${IMAGE_NAME}-cloud-models:${IMAGE_TAG}
+FROM_BOOTC_IMAGE ?= $(BOOTC_IMAGE)
+VENDOR ?=
+
+CONTAINER_TOOL ?= podman
+CONTAINER_TOOL_EXTRA_ARGS ?=
+EXTRA_RPM_PACKAGES ?=
+GRAPH_ROOT=$(shell podman info --format '{{ .Store.GraphRoot }}')
+UMASK=$(shell umask)
+IMAGE_VERSION_ID := $(or ${IMAGE_VERSION_ID},$(shell git rev-parse --short HEAD))
+
+AUTH_JSON ?=
+
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct)
+
+BOOTC_IMAGE_BUILDER ?= quay.io/centos-bootc/bootc-image-builder
+BUILD_ARG_FILE ?=
+IMAGE_BUILDER_CONFIG ?=
+IMAGE_BUILDER_EXTRA_ARGS ?=
+DISK_TYPE ?= qcow2
+DISK_UID ?= $(shell id -u)
+DISK_GID ?= $(shell id -g)
+
+ARCH ?= $(shell arch)
+
+DRIVER_VERSION ?=
+KERNEL_VERSION ?= $(shell skopeo inspect --format json docker://${FROM} | jq -r '.Labels["ostree.linux"]' | sed "s/\.${ARCH}//")
+
+INSTRUCTLAB_IMAGE ?= $(REGISTRY)/$(REGISTRY_ORG)/instructlab-$(HARDWARE):$(IMAGE_TAG)
+WRAPPER = $(CURDIR)/../ilab-wrapper/ilab
+QLORA_WRAPPER = $(CURDIR)/../ilab-wrapper/ilab-qlora
+TRAIN_WRAPPER =  $(CURDIR)/../ilab-wrapper/ilab-training-launcher
+OUTDIR = $(CURDIR)/../build
+MODELS_CONTAINERFILE = $(OUTDIR)/Containerfile.models
+
+DRIVER_TOOLKIT_BASE_IMAGE ?=
+DRIVER_TOOLKIT_IMAGE_NAME ?= driver-toolkit
+DRIVER_TOOLKIT_IMAGE_TAG ?= ${KERNEL_VERSION}
+DRIVER_TOOLKIT_IMAGE ?= ${REGISTRY}/${REGISTRY_ORG}/${DRIVER_TOOLKIT_IMAGE_NAME}:${DRIVER_TOOLKIT_IMAGE_TAG}
+
+ENABLE_RT ?=
+
+SSH_PUBKEY ?= $(shell cat ${HOME}/.ssh/id_rsa.pub 2> /dev/null)
+
+.PHONY: prepare-files
+prepare-files: $(OUTDIR)/$(WRAPPER) $(OUTDIR)/$(QLORA_WRAPPER) $(OUTDIR)/$(TRAIN_WRAPPER) $(OUTDIR) common-services
+
+$(OUTDIR):
+	mkdir -p $(OUTDIR)
+$(OUTDIR)/$(WRAPPER): $(OUTDIR)
+	cp -pf $(WRAPPER) $(OUTDIR)
+$(OUTDIR)/$(QLORA_WRAPPER): $(OUTDIR)
+	cp -pf $(QLORA_WRAPPER) $(OUTDIR)
+$(OUTDIR)/$(TRAIN_WRAPPER): $(OUTDIR)
+	cp -pf $(TRAIN_WRAPPER) $(OUTDIR)
+
+.PHONY: common-services
+common-services:
+	mkdir -p build; cp -pR ../common/usr build
+
+
+.PHONY: check-sshkey
+check-sshkey:
+	@test -n "$(SSH_PUBKEY)" || \
+		(echo -n "Error: no ssh key defined! "; \
+		 echo "Create ~/.ssh/id_rsa.pub or set SSH_PUBKEY"; exit 1)
+
+.PHONY: push
+push:
+	podman push "${REGISTRY}/${REGISTRY_ORG}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+.PHONY: check-umask
+check-umask:
+	@test "$(UMASK)" = "0022" || \
+		(echo; echo -n "Error: umask $(UMASK) will cause unexpected behaviour: use umask 022! "; \
+		 echo "Verify the `ai-lab-recipes` git repository was cloned with umask 0022"; exit 1)
+
+.PHONY: bootc-image-builder
+bootc-image-builder:
+	mkdir -p build/store build/output
+	podman run \
+	  $(AUTH_JSON:%=-v %:/run/containers/0/auth.json) \
+	  --rm \
+	  -ti \
+	  --privileged \
+	  --pull newer \
+	  -v $(GRAPH_ROOT):/var/lib/containers/storage \
+	  -v ./build/store:/store \
+	  -v ./build/output:/output \
+	  $(IMAGE_BUILDER_CONFIG:%=-v %:/config$(suffix $(IMAGE_BUILDER_CONFIG))) \
+	  ${CONTAINER_TOOL_EXTRA_ARGS} \
+	  $(BOOTC_IMAGE_BUILDER) \
+	    $(IMAGE_BUILDER_CONFIG:%=--config /config$(suffix $(IMAGE_BUILDER_CONFIG))) \
+	    ${IMAGE_BUILDER_EXTRA_ARGS} \
+	    --chown $(DISK_UID):$(DISK_GID) \
+	    --local \
+	    --type $(DISK_TYPE) \
+	    $(ARCH:%=--target-arch %) \
+	    $(BOOTC_IMAGE)
+
+.PHONY: driver-toolkit
+driver-toolkit:
+	"${CONTAINER_TOOL}" build \
+		$(ARCH:%=--platform linux/%) \
+		$(BUILD_ARG_FILE:%=--build-arg-file=%) \
+		$(ENABLE_RT:%=--build-arg ENABLE_RC=%) \
+		$(FROM:%=--build-arg BASEIMAGE=%) \
+		$(DRIVER_TOOLKIT_BASE_IMAGE:%=--build-arg BASEIMAGE=%) \
+		$(KERNEL_VERSION:%=--build-arg KERNEL_VERSION=%) \
+		$(SOURCE_DATE_EPOCH:%=--timestamp=%) \
+		--file ../common/driver-toolkit/Containerfile \
+		--tag "${DRIVER_TOOLKIT_IMAGE}" \
+		${CONTAINER_TOOL_EXTRA_ARGS} .
+
+.PHONY: clean
+clean:
+	rm -rf build
