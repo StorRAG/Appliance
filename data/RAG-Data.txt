@@ -1,0 +1,3 @@
+My name is Ben. I am a Fish and I have 1 Dollar.
+My name is Mike. I am a Cat and I have 2 Dollars.
+My name is Fred. I am a Dog and I have 3 Dollars.
