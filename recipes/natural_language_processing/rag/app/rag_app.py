@@ -47,7 +47,7 @@ def read_file(file):
     raw_documents = loader.load()
     return raw_documents
 
-st.title("📚 StorRAG")
+st.title("📚 StorRAG MVP")
 with st.sidebar:
     file = st.file_uploader(label="📄 Upload Document",
                         type=[".txt",".pdf"],
